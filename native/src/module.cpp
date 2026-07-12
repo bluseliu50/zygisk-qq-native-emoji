@@ -2,9 +2,6 @@
 #include "zygisk.hpp"
 
 #include <jni.h>
-#include <dlfcn.h>
-#include <elf.h>
-#include <link.h>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -31,11 +28,8 @@ static uint32_t g_entry_point_offset = 0;   // entry_point_from_quick_compiled_c
 static void* g_jni_trampoline = nullptr;    // art_quick_generic_jni_trampoline
 
 // --- Access flag constants ---
-// Source: art.modifiers in AOSP (stable across all versions)
-static constexpr uint32_t kAccPublic    = 0x0001;
-static constexpr uint32_t kAccStatic    = 0x0008;
-static constexpr uint32_t kAccNative    = 0x0100;
-static constexpr uint32_t kAccPublic2   = 0x0006; // public+private bits used for verification
+// Source: art/modifiers.h in AOSP (stable across all versions)
+static constexpr uint32_t kAccNative = 0x0100;
 // Version-dependent flags
 static uint32_t kAccCompileDontBother = 0;
 static uint32_t kAccPreCompiled = 0;
@@ -53,122 +47,10 @@ static jint doubleEmojiCallback(JNIEnv*, jobject, jint, jint) {
 }
 
 // ============================================================
-// ELF symbol resolver — parse .dynsym from a loaded module's memory
-// Works even when dlopen() is blocked by Android linker namespaces
+// Initialize version-dependent access flag values
 // ============================================================
 
-static void* findElfSymbol(uintptr_t loadBias, const char* symName) {
-    auto* ehdr = reinterpret_cast<const ElfW(Ehdr)*>(loadBias);
-    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return nullptr;
-
-    // Find PT_DYNAMIC program header
-    auto* phdrTable = reinterpret_cast<const ElfW(Phdr)*>(loadBias + ehdr->e_phoff);
-    const ElfW(Dyn)* dyn = nullptr;
-    for (int i = 0; i < ehdr->e_phnum; i++) {
-        if (phdrTable[i].p_type == PT_DYNAMIC) {
-            dyn = reinterpret_cast<const ElfW(Dyn)*>(loadBias + phdrTable[i].p_vaddr);
-            break;
-        }
-    }
-    if (!dyn) return nullptr;
-
-    // Extract DT_SYMTAB, DT_STRTAB, DT_HASH from dynamic section
-    const ElfW(Sym)* symtab = nullptr;
-    const char* strtab = nullptr;
-    uintptr_t strtabAddr = 0;
-    const uint32_t* hashTable = nullptr;
-
-    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
-        switch (d->d_tag) {
-            case DT_SYMTAB:
-                symtab = reinterpret_cast<const ElfW(Sym)*>(loadBias + d->d_un.d_ptr);
-                break;
-            case DT_STRTAB:
-                strtab = reinterpret_cast<const char*>(loadBias + d->d_un.d_ptr);
-                strtabAddr = loadBias + d->d_un.d_ptr;
-                break;
-            case DT_HASH:
-                hashTable = reinterpret_cast<const uint32_t*>(loadBias + d->d_un.d_ptr);
-                break;
-        }
-    }
-    if (!symtab || !strtab) return nullptr;
-
-    // Determine symbol count
-    size_t symCount = 0;
-    if (hashTable) {
-        symCount = hashTable[1];  // nchain = number of symbols
-    } else {
-        // Fallback: estimate from strtab - symtab distance
-        symCount = (strtabAddr - reinterpret_cast<uintptr_t>(symtab)) / sizeof(ElfW(Sym));
-    }
-
-    for (size_t i = 0; i < symCount; i++) {
-        if (symtab[i].st_name == 0) continue;
-        const char* name = strtab + symtab[i].st_name;
-        if (strcmp(name, symName) == 0 && symtab[i].st_value != 0) {
-            return reinterpret_cast<void*>(loadBias + symtab[i].st_value);
-        }
-    }
-    return nullptr;
-}
-
-// Callback data for dl_iterate_phdr
-struct SymbolSearchData {
-    const char* libName;
-    const char* symName;
-    void* result;
-};
-
-static int phdrCallback(struct dl_phdr_info* info, size_t, void* data) {
-    auto* search = static_cast<SymbolSearchData*>(data);
-    if (info->dlpi_name && strstr(info->dlpi_name, search->libName)) {
-        search->result = findElfSymbol(static_cast<uintptr_t>(info->dlpi_addr), search->symName);
-        if (search->result) return 1;  // stop iteration
-    }
-    return 0;
-}
-
-static void resolveSymbols(int api_level) {
-    const char* trampolineNames[] = {
-        "art_quick_generic_jni_trampoline",
-        "aoc_quick_generic_jni_trampoline"  // Alibaba YunOS AOC runtime
-    };
-
-    // Strategy 1: direct dlopen (works on older Android / some ROMs)
-    void* libart = dlopen("libart.so", RTLD_NOW);
-    if (libart) {
-        for (const char* name : trampolineNames) {
-            g_jni_trampoline = dlsym(libart, name);
-            if (g_jni_trampoline) break;
-        }
-        if (g_jni_trampoline) {
-            LOGI("Resolved trampoline via dlopen: %p", g_jni_trampoline);
-        }
-    } else {
-        LOGI("dlopen(libart.so) failed: %s — falling back to ELF parsing", dlerror());
-    }
-
-    // Strategy 2: parse ELF .dynsym in memory via dl_iterate_phdr
-    // This bypasses linker namespace restrictions (Android 11+)
-    if (!g_jni_trampoline) {
-        for (const char* name : trampolineNames) {
-            SymbolSearchData search{};
-            search.libName = "libart.so";
-            search.symName = name;
-            dl_iterate_phdr(phdrCallback, &search);
-            if (search.result) {
-                g_jni_trampoline = search.result;
-                LOGI("Resolved trampoline via ELF memory parsing: %p", g_jni_trampoline);
-                break;
-            }
-        }
-    }
-
-    if (!g_jni_trampoline) {
-        LOGE("Failed to resolve JNI trampoline symbol");
-    }
-
+static void initAccessFlags(int api_level) {
     // kAccCompileDontBother value depends on Android version
     if (api_level >= 27) {
         kAccCompileDontBother = 0x02000000;  // O_MR1+
@@ -183,52 +65,63 @@ static void resolveSymbols(int api_level) {
         kAccPreCompiled = 0x01000000;  // S+
     }
 
-    LOGI("Symbols resolved: api_level=%d, trampoline=%p", api_level, g_jni_trampoline);
+    LOGI("API level=%d, kAccCompileDontBother=0x%x, kAccPreCompiled=0x%x",
+         api_level, kAccCompileDontBother, kAccPreCompiled);
 }
 
 // ============================================================
-// Determine ArtMethod field offsets at runtime
+// Determine ArtMethod field offsets AND JNI trampoline at runtime.
 //
-// Strategy (same as Pine/epic):
+// Key insight: Object.hashCode() is a NATIVE method. Its ArtMethod's
+// entry_point_from_compiled_code_ already points to
+// art_quick_generic_jni_trampoline. We read it directly — no dlopen,
+// no ELF parsing, no symbol resolution needed.
+//
+// Offset strategy (same as Pine/epic):
 // 1. access_flags_ is at offset 4 (GcRoot<Class> is 4 bytes, then access_flags_)
-// 2. sizeof(ArtMethod) = difference between adjacent methods in the same class
+// 2. sizeof(ArtMethod) = gap between adjacent methods
 // 3. data_ and entry_point are the last two pointer-sized fields
 // ============================================================
 
-static void determineOffsets(JNIEnv* env) {
+static bool determineOffsets(JNIEnv* env) {
     jclass objClass = env->FindClass("java/lang/Object");
     if (!objClass || env->ExceptionCheck()) {
         env->ExceptionClear();
-        LOGE("Cannot find java.lang.Object for offset detection");
-        return;
+        LOGE("Cannot find java.lang.Object");
+        return false;
     }
 
-    // Get three virtual methods from Object — they should be adjacent in the
-    // ArtMethod array. Take the minimum pairwise gap = sizeof(ArtMethod).
-    jmethodID mids[3];
-    mids[0] = env->GetMethodID(objClass, "hashCode", "()I");
-    mids[1] = env->GetMethodID(objClass, "equals", "(Ljava/lang/Object;)Z");
-    mids[2] = env->GetMethodID(objClass, "toString", "()Ljava/lang/String;");
+    // Get hashCode — a native method whose entry_point IS the JNI trampoline
+    jmethodID hashCodeMid = env->GetMethodID(objClass, "hashCode", "()I");
+    jmethodID equalsMid = env->GetMethodID(objClass, "equals", "(Ljava/lang/Object;)Z");
+    jmethodID toStringMid = env->GetMethodID(objClass, "toString", "()Ljava/lang/String;");
 
-    if (env->ExceptionCheck() || !mids[0] || !mids[1] || !mids[2]) {
+    if (env->ExceptionCheck() || !hashCodeMid || !equalsMid || !toStringMid) {
         env->ExceptionClear();
-        LOGE("Cannot get Object methods for offset detection");
+        LOGE("Cannot get Object methods");
         env->DeleteLocalRef(objClass);
-        return;
+        return false;
     }
 
     // Convert jmethodID → real ArtMethod* via reflection.
     // FromReflectedMethod reads Method.artMethod field directly — works on all
     // Android versions including R+ where jmethodID may be index-encoded.
     uintptr_t ptrs[3];
+    jmethodID mids[3] = {hashCodeMid, equalsMid, toStringMid};
     for (int i = 0; i < 3; i++) {
         jobject ref = env->ToReflectedMethod(objClass, mids[i], JNI_FALSE);
         ptrs[i] = reinterpret_cast<uintptr_t>(env->FromReflectedMethod(ref));
         env->DeleteLocalRef(ref);
     }
+
+    // Keep hashCode's ArtMethod pointer for trampoline extraction
+    uintptr_t hashCodeArtMethod = ptrs[0];
+
     env->DeleteLocalRef(objClass);
 
-    // Sort ascending, take minimum nonzero gap
+    LOGI("hashCode ArtMethod @ %p", (void*)hashCodeArtMethod);
+
+    // Sort to find adjacent method pairs → sizeof(ArtMethod)
     if (ptrs[0] > ptrs[1]) std::swap(ptrs[0], ptrs[1]);
     if (ptrs[1] > ptrs[2]) std::swap(ptrs[1], ptrs[2]);
     if (ptrs[0] > ptrs[1]) std::swap(ptrs[0], ptrs[1]);
@@ -244,24 +137,32 @@ static void determineOffsets(JNIEnv* env) {
         artMethodSize = gap2;
     }
 
-    // Sanity check: ArtMethod is typically 24-48 bytes
     if (artMethodSize < sizeof(void*) * 2 || artMethodSize > 128) {
-        LOGE("Unusual ArtMethod size %zu — using fallback", artMethodSize);
-        // Fallback for Android O+ (our minimum target API 26):
-        // 64-bit: 32 bytes, 32-bit: 24 bytes
+        LOGE("Unusual ArtMethod size %zu, using fallback", artMethodSize);
         artMethodSize = (sizeof(void*) == 8) ? 32 : 24;
     }
 
-    // access_flags_ is at offset 4 (after GcRoot<Class> which is uint32_t)
-    g_access_flags_offset = 4;
-
     // PtrSizedFields are the last two pointer-sized fields:
     //   { void* data_, void* entry_point_from_quick_compiled_code_ }
+    g_access_flags_offset = 4;
     g_data_offset = artMethodSize - 2 * sizeof(void*);
     g_entry_point_offset = artMethodSize - sizeof(void*);
 
-    LOGI("ArtMethod: size=%zu, access_flags@%u, data@%u, entry@%u",
-         artMethodSize, g_access_flags_offset, g_data_offset, g_entry_point_offset);
+    // Read the JNI trampoline from hashCode's entry_point.
+    // hashCode() is native, so entry_point = art_quick_generic_jni_trampoline.
+    g_jni_trampoline = *reinterpret_cast<void**>(
+        hashCodeArtMethod + g_entry_point_offset);
+
+    LOGI("ArtMethod: size=%zu, access_flags@%u, data@%u, entry@%u, trampoline=%p",
+         artMethodSize, g_access_flags_offset, g_data_offset,
+         g_entry_point_offset, g_jni_trampoline);
+
+    if (!g_jni_trampoline) {
+        LOGE("Trampoline is null — cannot proceed");
+        return false;
+    }
+
+    return true;
 }
 
 // ============================================================
@@ -279,8 +180,7 @@ static void makeMethodReturnNegativeOne(JNIEnv* env, jobject method, void* nativ
         return;
     }
 
-    // Make ArtMethod memory writable. ART's method array is typically in the
-    // heap and already RW, but some hardened ROMs mark it read-only.
+    // Make ArtMethod memory writable
     long pageSize = sysconf(_SC_PAGE_SIZE);
     uintptr_t pageStart = reinterpret_cast<uintptr_t>(artMethod) & ~(pageSize - 1);
     if (mprotect(reinterpret_cast<void*>(pageStart), pageSize * 2,
@@ -289,7 +189,7 @@ static void makeMethodReturnNegativeOne(JNIEnv* env, jobject method, void* nativ
         return;
     }
 
-    // 1. Set access flags: add kAccNative, clear kAccPreCompiled, add kAccCompileDontBother
+    // 1. Set access flags: add kAccNative, clear kAccPreCompiled
     auto* flags = reinterpret_cast<uint32_t*>(artMethod + g_access_flags_offset);
     uint32_t oldFlags = *flags;
     uint32_t newFlags = oldFlags;
@@ -312,8 +212,6 @@ static void makeMethodReturnNegativeOne(JNIEnv* env, jobject method, void* nativ
 // Find and hook emoji methods in EmotcationConstants by signature.
 //
 // Matches: return type int, params all int, param count 1 or 2.
-// This mirrors the reference implementation's approach (match by signature,
-// not method name) since QQ may obfuscate method names.
 // ============================================================
 
 static void hookEmojiMethods(JNIEnv* env, jclass targetClass) {
@@ -327,7 +225,6 @@ static void hookEmojiMethods(JNIEnv* env, jclass targetClass) {
         return;
     }
 
-    // Get int.class (primitive int)
     jfieldID typeId = env->GetStaticFieldID(integerClass, "TYPE", "Ljava/lang/Class;");
     if (!typeId || env->ExceptionCheck()) {
         env->ExceptionClear();
@@ -338,7 +235,6 @@ static void hookEmojiMethods(JNIEnv* env, jclass targetClass) {
     jclass intClass = reinterpret_cast<jclass>(env->NewGlobalRef(intTypeObj));
     env->DeleteLocalRef(intTypeObj);
 
-    // Method IDs for reflection
     jmethodID getDeclaredMethods = env->GetMethodID(classClass,
         "getDeclaredMethods", "()[Ljava/lang/reflect/Method;");
     jmethodID getReturnType = env->GetMethodID(methodClass,
@@ -353,7 +249,6 @@ static void hookEmojiMethods(JNIEnv* env, jclass targetClass) {
         return;
     }
 
-    // Get all declared methods of EmotcationConstants
     jobjectArray methods = reinterpret_cast<jobjectArray>(
         env->CallObjectMethod(targetClass, getDeclaredMethods));
     if (!methods || env->ExceptionCheck()) {
@@ -420,11 +315,10 @@ static void hookEmojiMethods(JNIEnv* env, jclass targetClass) {
 // ============================================================
 
 static void pollAndHook(JNIEnv* env) {
-    // Get the app's ClassLoader via ActivityThread.currentApplication()
     jclass activityThread = env->FindClass("android/app/ActivityThread");
     if (!activityThread || env->ExceptionCheck()) {
         env->ExceptionClear();
-        LOGE("ActivityThread not found — cannot get app ClassLoader");
+        LOGE("ActivityThread not found");
         return;
     }
 
@@ -450,7 +344,6 @@ static void pollAndHook(JNIEnv* env) {
     for (int attempt = 0; attempt < 120; attempt++) {
         env->ExceptionClear();
 
-        // Get current Application (may be null early in startup)
         jobject app = env->CallStaticObjectMethod(activityThread, currentApp);
         if (env->ExceptionCheck() || !app) {
             env->ExceptionClear();
@@ -466,7 +359,6 @@ static void pollAndHook(JNIEnv* env) {
             continue;
         }
 
-        // Try to load the target class
         jclass targetClass = reinterpret_cast<jclass>(
             env->CallObjectMethod(classLoader, loadClass, className));
         env->DeleteLocalRef(classLoader);
@@ -486,7 +378,7 @@ static void pollAndHook(JNIEnv* env) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
-    LOGE("EmotcationConstants not loaded after 60s — giving up");
+    LOGE("EmotcationConstants not loaded after 60s");
     env->DeleteLocalRef(activityThread);
     env->DeleteLocalRef(classLoaderClass);
     env->DeleteLocalRef(contextClass);
@@ -513,22 +405,16 @@ public:
         env->ReleaseStringUTFChars(args->nice_name, name);
 
         if (!is_qq) {
-            // Not QQ — unload our .so after postAppSpecialize returns.
-            // postAppSpecialize will still be called, so it must early-return.
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
         }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
-        // CRITICAL: postAppSpecialize runs for ALL app processes.
-        // Only execute our logic in QQ. Non-QQ processes set
-        // DLCLOSE_MODULE_LIBRARY in preAppSpecialize and must bail out here.
         if (!is_qq) return;
 
         JNIEnv* env;
         g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
 
-        // Read API level from system property
         char sdkStr[8] = {0};
         __system_property_get("ro.build.version.sdk", sdkStr);
         int apiLevel = atoi(sdkStr);
@@ -537,15 +423,16 @@ public:
             return;
         }
 
-        // Resolve libart.so symbols and determine ArtMethod offsets
-        resolveSymbols(apiLevel);
-        if (!g_jni_trampoline) {
-            LOGE("Cannot proceed without JNI trampoline");
+        initAccessFlags(apiLevel);
+
+        // Determine ArtMethod offsets AND read JNI trampoline from hashCode
+        if (!determineOffsets(env)) {
+            LOGE("Failed to determine offsets/trampoline");
             return;
         }
-        determineOffsets(env);
 
-        // Start polling thread — it will AttachCurrentThread to get its own JNIEnv
+        LOGI("Starting polling thread");
+
         std::thread([]() {
             JNIEnv* env;
             JavaVMAttachArgs attachArgs = {JNI_VERSION_1_6, "QQEmojiHook", nullptr};
