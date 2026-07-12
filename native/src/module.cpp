@@ -509,17 +509,22 @@ public:
         g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
 
         const char* name = env->GetStringUTFChars(args->nice_name, nullptr);
-        bool isQQ = (name && strcmp(name, "com.tencent.mobileqq") == 0);
+        is_qq = (name && strcmp(name, "com.tencent.mobileqq") == 0);
         env->ReleaseStringUTFChars(args->nice_name, name);
 
-        if (!isQQ) {
-            // Not QQ — unload our .so immediately after specialization.
-            // Safe because we haven't hooked anything yet.
+        if (!is_qq) {
+            // Not QQ — unload our .so after postAppSpecialize returns.
+            // postAppSpecialize will still be called, so it must early-return.
             api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
         }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
+        // CRITICAL: postAppSpecialize runs for ALL app processes.
+        // Only execute our logic in QQ. Non-QQ processes set
+        // DLCLOSE_MODULE_LIBRARY in preAppSpecialize and must bail out here.
+        if (!is_qq) return;
+
         JNIEnv* env;
         g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
 
@@ -555,6 +560,7 @@ public:
 
 private:
     zygisk::Api* api = nullptr;
+    bool is_qq = false;
 };
 
 REGISTER_ZYGISK_MODULE(QQEmojiModule)
