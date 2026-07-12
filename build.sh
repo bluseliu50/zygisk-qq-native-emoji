@@ -2,8 +2,9 @@
 set -e
 
 # === Configuration ===
-VERSION="v1.0.0"
-VERSION_CODE=1
+# === Configuration (overridable via env vars for CI) ===
+VERSION="${MODULE_VERSION:-v1.0.0}"
+VERSION_CODE="${MODULE_VERSION_CODE:-1}"
 MODULE_ID="qq_native_emoji"
 ABIS=("arm64-v8a" "armeabi-v7a")
 
