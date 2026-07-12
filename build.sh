@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# === Configuration ===
 # === Configuration (overridable via env vars for CI) ===
 VERSION="${MODULE_VERSION:-v1.0.0}"
 VERSION_CODE="${MODULE_VERSION_CODE:-1}"
