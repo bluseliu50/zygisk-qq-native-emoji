@@ -3,6 +3,8 @@
 
 #include <jni.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
@@ -51,23 +53,120 @@ static jint doubleEmojiCallback(JNIEnv*, jobject, jint, jint) {
 }
 
 // ============================================================
-// Resolve libart.so symbols
+// ELF symbol resolver — parse .dynsym from a loaded module's memory
+// Works even when dlopen() is blocked by Android linker namespaces
 // ============================================================
 
-static void resolveSymbols(int api_level) {
-    void* libart = dlopen("libart.so", RTLD_NOW);
-    if (!libart) {
-        LOGE("Cannot dlopen libart.so: %s", dlerror());
-        return;
+static void* findElfSymbol(uintptr_t loadBias, const char* symName) {
+    auto* ehdr = reinterpret_cast<const ElfW(Ehdr)*>(loadBias);
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) return nullptr;
+
+    // Find PT_DYNAMIC program header
+    auto* phdrTable = reinterpret_cast<const ElfW(Phdr)*>(loadBias + ehdr->e_phoff);
+    const ElfW(Dyn)* dyn = nullptr;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdrTable[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<const ElfW(Dyn)*>(loadBias + phdrTable[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return nullptr;
+
+    // Extract DT_SYMTAB, DT_STRTAB, DT_HASH from dynamic section
+    const ElfW(Sym)* symtab = nullptr;
+    const char* strtab = nullptr;
+    uintptr_t strtabAddr = 0;
+    const uint32_t* hashTable = nullptr;
+
+    for (const ElfW(Dyn)* d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:
+                symtab = reinterpret_cast<const ElfW(Sym)*>(loadBias + d->d_un.d_ptr);
+                break;
+            case DT_STRTAB:
+                strtab = reinterpret_cast<const char*>(loadBias + d->d_un.d_ptr);
+                strtabAddr = loadBias + d->d_un.d_ptr;
+                break;
+            case DT_HASH:
+                hashTable = reinterpret_cast<const uint32_t*>(loadBias + d->d_un.d_ptr);
+                break;
+        }
+    }
+    if (!symtab || !strtab) return nullptr;
+
+    // Determine symbol count
+    size_t symCount = 0;
+    if (hashTable) {
+        symCount = hashTable[1];  // nchain = number of symbols
+    } else {
+        // Fallback: estimate from strtab - symtab distance
+        symCount = (strtabAddr - reinterpret_cast<uintptr_t>(symtab)) / sizeof(ElfW(Sym));
     }
 
-    g_jni_trampoline = dlsym(libart, "art_quick_generic_jni_trampoline");
-    if (!g_jni_trampoline) {
-        // Alibaba YunOS AOC runtime uses a different name
-        g_jni_trampoline = dlsym(libart, "aoc_quick_generic_jni_trampoline");
+    for (size_t i = 0; i < symCount; i++) {
+        if (symtab[i].st_name == 0) continue;
+        const char* name = strtab + symtab[i].st_name;
+        if (strcmp(name, symName) == 0 && symtab[i].st_value != 0) {
+            return reinterpret_cast<void*>(loadBias + symtab[i].st_value);
+        }
     }
+    return nullptr;
+}
+
+// Callback data for dl_iterate_phdr
+struct SymbolSearchData {
+    const char* libName;
+    const char* symName;
+    void* result;
+};
+
+static int phdrCallback(struct dl_phdr_info* info, size_t, void* data) {
+    auto* search = static_cast<SymbolSearchData*>(data);
+    if (info->dlpi_name && strstr(info->dlpi_name, search->libName)) {
+        search->result = findElfSymbol(static_cast<uintptr_t>(info->dlpi_addr), search->symName);
+        if (search->result) return 1;  // stop iteration
+    }
+    return 0;
+}
+
+static void resolveSymbols(int api_level) {
+    const char* trampolineNames[] = {
+        "art_quick_generic_jni_trampoline",
+        "aoc_quick_generic_jni_trampoline"  // Alibaba YunOS AOC runtime
+    };
+
+    // Strategy 1: direct dlopen (works on older Android / some ROMs)
+    void* libart = dlopen("libart.so", RTLD_NOW);
+    if (libart) {
+        for (const char* name : trampolineNames) {
+            g_jni_trampoline = dlsym(libart, name);
+            if (g_jni_trampoline) break;
+        }
+        if (g_jni_trampoline) {
+            LOGI("Resolved trampoline via dlopen: %p", g_jni_trampoline);
+        }
+    } else {
+        LOGI("dlopen(libart.so) failed: %s — falling back to ELF parsing", dlerror());
+    }
+
+    // Strategy 2: parse ELF .dynsym in memory via dl_iterate_phdr
+    // This bypasses linker namespace restrictions (Android 11+)
     if (!g_jni_trampoline) {
-        LOGE("art_quick_generic_jni_trampoline symbol not found");
+        for (const char* name : trampolineNames) {
+            SymbolSearchData search{};
+            search.libName = "libart.so";
+            search.symName = name;
+            dl_iterate_phdr(phdrCallback, &search);
+            if (search.result) {
+                g_jni_trampoline = search.result;
+                LOGI("Resolved trampoline via ELF memory parsing: %p", g_jni_trampoline);
+                break;
+            }
+        }
+    }
+
+    if (!g_jni_trampoline) {
+        LOGE("Failed to resolve JNI trampoline symbol");
     }
 
     // kAccCompileDontBother value depends on Android version
