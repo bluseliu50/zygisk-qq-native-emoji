@@ -1,0 +1,8 @@
+refer/
+build/
+*.zip
+*.apk
+local.properties
+.idea/
+.gradle/
+.cxx/
